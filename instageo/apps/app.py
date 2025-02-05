@@ -56,14 +56,13 @@ def generate_map(
         tiles_to_consider = [
             tile
             for tile in prediction_tiles
-            if os.path.basename(tile).split("_")[1].strip("T") in country_tiles
+            if os.path.basename(tile).split("_")[3].strip("T") in country_tiles
         ]
 
         if not tiles_to_consider:
             raise FileNotFoundError(
                 "No GeoTIFF files found for the given year, month, and country."
             )
-
         fig = create_map_with_geotiff_tiles(tiles_to_consider)
         st.plotly_chart(fig, use_container_width=True)
     except (ValueError, FileNotFoundError, Exception) as e:
@@ -94,7 +93,7 @@ def main() -> None:
             "ISO 3166-1 Alpha-2 Country Code:",
             options=list(countries_to_tiles_map.keys()),
         )
-        year = st.sidebar.number_input("Select Year", 2023, 2024)
+        year = st.sidebar.number_input("Select Year", 2016, 2024)
         month = st.sidebar.number_input("Select Month", 1, 12)
 
     if st.sidebar.button("Generate Map"):

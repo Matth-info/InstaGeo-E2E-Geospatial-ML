@@ -28,6 +28,7 @@ from typing import Any, Callable, List, Optional, Tuple
 import hydra
 import numpy as np
 import pytorch_lightning as pl
+import torch.nn.functional as F
 import rasterio
 import torch
 import torch.nn as nn
@@ -214,8 +215,91 @@ def create_dataloader(
             collate_fn=collate_fn,
             pin_memory=pin_memory,
         )
+    
+import torch.functional as F
+class DiceLoss(nn.Module):
+    def __init__(self, weight=None, size_average=True):
+        super(DiceLoss, self).__init__()
 
+    def forward(self, inputs, targets, smooth=1):
+        
+        #comment out if your model contains a sigmoid or equivalent activation layer
+        inputs = F.sigmoid(inputs)       
+        
+        #flatten label and prediction tensors
+        inputs = inputs.view(-1)
+        targets = targets.view(-1)
+        
+        intersection = (inputs * targets).sum()                            
+        dice = (2.*intersection + smooth)/(inputs.sum() + targets.sum() + smooth)  
+        
+        return 1 - dice
+    
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+class MulticlassDiceLoss(nn.Module):
+    """Multiclass Dice Loss with Ignore Index support."""
+    
+    def __init__(self, num_classes, softmax_dim=None, ignore_index=-1):
+        super().__init__()
+        self.num_classes = num_classes
+        self.softmax_dim = softmax_dim
+        self.ignore_index = ignore_index
+
+    def forward(self, logits, targets, reduction='mean', smooth=1e-6):
+        """
+        Computes the Dice loss for multiclass segmentation while ignoring a specific class index.
+
+        Args:
+            logits: Predicted tensor of shape (B, C, H, W).
+            targets: Ground truth tensor of shape (B, H, W) with class indices.
+            reduction: Reduction method (ignored, as dice loss computes a mean inherently).
+            smooth: Smoothing term to avoid division by zero.
+
+        Returns:
+            Dice loss.
+        """
+        # Apply softmax if needed
+        probabilities = logits
+        if self.softmax_dim is not None:
+            probabilities = F.softmax(logits, dim=self.softmax_dim)
+
+        # Ensure targets are long integers
+        targets = targets.long()
+
+        # Create a mask for valid pixels (ignore -1 labels)
+        valid_mask = targets != self.ignore_index  # Shape: (B, H, W)
+
+        # Set ignored labels to zero temporarily (for one-hot encoding)
+        masked_targets = targets.clone()
+        masked_targets[~valid_mask] = 0  # Set ignored pixels to class 0 (temporary)
+
+        # One-hot encode targets
+        targets_one_hot = F.one_hot(masked_targets, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+
+        # Apply the mask: Exclude ignored pixels from loss computation
+        valid_mask = valid_mask.unsqueeze(1).expand_as(targets_one_hot)  # (B, C, H, W)
+        targets_one_hot = targets_one_hot * valid_mask
+        probabilities = probabilities * valid_mask
+
+        # Compute Dice loss
+        intersection = (targets_one_hot * probabilities).sum(dim=(0, 2, 3))
+        union = targets_one_hot.sum(dim=(0, 2, 3)) + probabilities.sum(dim=(0, 2, 3))
+
+        # Compute per-class Dice loss
+        dice_coeff = (2. * intersection + smooth) / (union + smooth)
+        dice_loss = -dice_coeff.log()
+
+        # Ignore ignored class in final loss computation
+        if 0 <= self.ignore_index < self.num_classes:
+            dice_loss = torch.cat([dice_loss[:self.ignore_index], dice_loss[self.ignore_index+1:]])
+
+        return dice_loss.mean()
+
+    
+# end class MulticlassDiceLoss
 class PrithviSegmentationModule(pl.LightningModule):
     """Prithvi Segmentation PyTorch Lightning Module."""
 
@@ -229,6 +313,7 @@ class PrithviSegmentationModule(pl.LightningModule):
         class_weights: List[float] = [1, 2],
         ignore_index: int = -100,
         weight_decay: float = 1e-2,
+        loss_type = "ce"
     ) -> None:
         """Initialization.
 
@@ -251,11 +336,17 @@ class PrithviSegmentationModule(pl.LightningModule):
             num_classes=num_classes,
             temporal_step=temporal_step,
             freeze_backbone=freeze_backbone,
+            head_type="segformer"
         )
         weight_tensor = torch.tensor(class_weights).float() if class_weights else None
-        self.criterion = nn.CrossEntropyLoss(
-            ignore_index=ignore_index, weight=weight_tensor
-        )
+        if loss_type == "ce":
+            self.criterion = nn.CrossEntropyLoss(
+                ignore_index=ignore_index, weight=weight_tensor
+            )
+        elif loss_type == "dice":
+            self.criterion = MulticlassDiceLoss(
+                num_classes=2, softmax_dim=1, ignore_index=ignore_index
+            )
         self.learning_rate = learning_rate
         self.ignore_index = ignore_index
         self.weight_decay = weight_decay
@@ -581,7 +672,7 @@ def main(cfg: DictConfig) -> None:
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=1,
+            num_workers=4,
         )
         mean, std = compute_mean_std(train_loader)
         print(mean)
@@ -639,6 +730,7 @@ def main(cfg: DictConfig) -> None:
             class_weights=cfg.train.class_weights,
             ignore_index=cfg.train.ignore_index,
             weight_decay=cfg.train.weight_decay,
+            loss_type=cfg.train.loss_type
         )
         hydra_out_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         print("Hydra output directory : ", hydra_out_dir)

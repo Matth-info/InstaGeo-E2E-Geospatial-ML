@@ -44,6 +44,7 @@ dataloader:
 mode: train
 model:
   freeze_backbone: true
+  head_type: null
   num_classes: 2
 output_dir: null
 root_dir: null
@@ -57,13 +58,14 @@ train:
   batch_size: 8
   class_weights:
   - 1
-  - 10
+  - 1
   ignore_index: -1
   learning_rate: 0.0001
+  loss_type: ce
   mixed_precision: false
   num_epochs: 20
   number_workers: 4
-  random_sampler: true
+  random_sampler: false
   weight_decay: 0.1
 train_filepath: null
 valid_filepath: null
