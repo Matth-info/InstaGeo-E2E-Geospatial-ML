@@ -28,6 +28,7 @@ import rasterio
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import torch
 
 from instageo.model.dataloader import crop_array
 
@@ -150,9 +151,8 @@ def chip_inference(
                 prediction_batch = model(data)
                 prediction_cls = (
                     torch.nn.functional.softmax(prediction_batch, dim=1)
-                    .argmax(dim=1)
                     .cpu()
-                    .numpy()
+                    .numpy()[:, 1, :, :]
                 )
 
                 profiles = []
@@ -176,3 +176,4 @@ def chip_inference(
                 ]
                 for future in futures:
                     future.result()
+

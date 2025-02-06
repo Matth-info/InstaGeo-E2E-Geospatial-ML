@@ -1,53 +1,69 @@
-# config.yaml
-root_dir: null
-valid_filepath: null
-train_filepath: null
-test_filepath: null
 checkpoint_path: null
-mode: train # train or eval
-
-train:
-  learning_rate: 0.0001
-  num_epochs: 20
-  batch_size: 8
-  class_weights: [1, 1]
-  ignore_index: -1
-  weight_decay: 0.1
-
-model:
-  freeze_backbone: False
-  num_classes: 2
-
 dataloader:
-  # 3*(Blue, Green, Red, Narrow NIR, SWIR 1, SWIR 2)
-  bands: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-  mean:
-    [
-      623.2724609375,
-      1247.657958984375,
-      1772.24169921875,
-      2371.256103515625,
-      2862.867431640625,
-      2357.759765625,
-    ]
-  std:
-    [
-      2182.050048828125,
-      2248.420654296875,
-      2302.53515625,
-      2372.204345703125,
-      2398.52685546875,
-      2292.96435546875,
-    ]
-  img_size: 256
-  temporal_dim: 3
-  replace_label: [-9999, -1]
-  reduce_to_zero: False
-  no_data_value: -9999
+  bands:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
   constant_multiplier: 1.0
-
-test:
   img_size: 256
+  mean:
+  - 670.5441284179688
+  - 1267.7974853515625
+  - 1772.599365234375
+  - 2415.69091796875
+  - 2879.2431640625
+  - 2337.822509765625
+  no_data_value: -9999
+  reduce_to_zero: false
+  replace_label:
+  - -9999
+  - -1
+  std:
+  - 2146.305419921875
+  - 2203.416259765625
+  - 2247.03515625
+  - 2310.74755859375
+  - 2322.708984375
+  - 2211.968505859375
+  temporal_dim: 3
+mode: train
+model:
+  freeze_backbone: true
+  num_classes: 2
+output_dir: null
+root_dir: null
+test:
   crop_size: 256
+  img_size: 256
+  mask_cloud: false
   stride: 256
-  mask_cloud: False
+test_filepath: null
+train:
+  batch_size: 8
+  class_weights:
+  - 1
+  - 10
+  ignore_index: -1
+  learning_rate: 0.0001
+  mixed_precision: false
+  num_epochs: 20
+  number_workers: 4
+  random_sampler: true
+  weight_decay: 0.1
+train_filepath: null
+valid_filepath: null

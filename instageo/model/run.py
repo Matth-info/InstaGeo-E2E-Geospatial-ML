@@ -32,10 +32,12 @@ import rasterio
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary, ProgressBar
 from pytorch_lightning.loggers import TensorBoardLogger
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
+import random
+from collections import Counter
 
 from instageo.model.dataloader import (
     InstaGeoDataset,
@@ -113,6 +115,55 @@ def infer_collate_fn(batch: tuple[torch.Tensor]) -> tuple[torch.Tensor, torch.Te
     filepaths = [a[1] for a in batch]
     return (data, labels), filepaths
 
+def build_random_weighted_sampler(dataset: Dataset,  subset_size=None, seed: int = None):
+
+    """
+        Define a WeightedRandomSampler for a segmentation dataset to address class imbalance.
+
+        Args:
+            dataset: A segmentation dataset where each sample includes an image and its corresponding mask.
+            mask_key: Key to access the mask in the dataset sample (default: "post_mask").
+            subset_size: Number of random samples to use for estimating class weights. If None, uses the full dataset.
+            seed : seed number 
+        Returns:
+            sampler: A WeightedRandomSampler for balanced class sampling.
+            class_weights: Inversely propotional class weights for imbalance dataset. 
+    """
+    print("Computing Weighted Random Sampler !")
+    if seed is not None : random.seed(seed) 
+    # Determine subset of dataset to analyze (optional)
+    if subset_size is not None:
+        sampled_indices = random.sample(range(len(dataset)), min(len(dataset), subset_size))
+    else:
+        sampled_indices = range(len(dataset))
+
+    # Initialize a counter for pixel-level class frequencies
+    class_counts = Counter()
+     # Loop through the sampled subset of the dataset to count class frequencies in masks
+    for i in tqdm(sampled_indices, desc="Counting class frequencies"):
+        mask = dataset[i][1]
+        mask_flat = mask.flatten().numpy()  # Flatten the mask to count pixel-level classes
+        class_counts.update(mask_flat)
+    
+    # Convert class counts to weights (inverse frequency)
+    total_pixels = sum(class_counts.values())
+    class_weights = {cls: total_pixels / (count + 1e-6) for cls, count in class_counts.items()}
+
+    # Assign a weight to each sample based on the class distribution in its mask
+    sample_weights = []
+    for i, input in tqdm(enumerate(dataset), desc="Assigning sample weights"):
+        mask = input[1]
+        mask_flat = mask.flatten().numpy()
+        unique, counts = np.unique(mask_flat, return_counts=True)
+        pixel_weights = np.array([class_weights[cls] for cls in unique])
+        sample_weight = np.dot(counts, pixel_weights) / counts.sum()
+        sample_weights.append(sample_weight)
+
+    # Create the WeightedRandomSampler
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(dataset), replacement=True)
+
+    print(f"Weighted Class : {class_weights}")
+    return sampler 
 
 def create_dataloader(
     dataset: Dataset,
@@ -121,6 +172,7 @@ def create_dataloader(
     num_workers: int = 1,
     collate_fn: Optional[Callable] = None,
     pin_memory: bool = True,
+    random_sampler : bool = False
 ) -> DataLoader:
     """Create a DataLoader for the given dataset.
 
@@ -139,14 +191,29 @@ def create_dataloader(
     Returns:
         DataLoader: An instance of the PyTorch DataLoader.
     """
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        pin_memory=pin_memory,
-    )
+    if random_sampler:
+        sampler = build_random_weighted_sampler(
+                    dataset,  
+                    subset_size=100, 
+                    seed = 42
+                )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            sampler=sampler,
+            pin_memory=pin_memory,
+        )
+    else:
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+        )
 
 
 class PrithviSegmentationModule(pl.LightningModule):
@@ -277,11 +344,11 @@ class PrithviSegmentationModule(pl.LightningModule):
             A tuple containing the list of optimizers and the list of LR schedulers.
         """
         optimizer = torch.optim.AdamW(
-            self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+            self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay, betas=(0.95, 0.999)
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=10, T_mult=2, eta_min=0
-        )
+            optimizer, T_0=5, T_mult=2, eta_min=0
+        ) # T_0=10,
         return [optimizer], [scheduler]
 
     def log_metrics(
@@ -557,10 +624,11 @@ def main(cfg: DictConfig) -> None:
             constant_multiplier=cfg.dataloader.constant_multiplier,
         )
         train_loader = create_dataloader(
-            train_dataset, batch_size=batch_size, shuffle=True, num_workers=1
+            train_dataset, batch_size=batch_size, shuffle=True, num_workers=cfg.train.number_workers, 
+            random_sampler=cfg.train.random_sampler
         )
         valid_loader = create_dataloader(
-            valid_dataset, batch_size=batch_size, shuffle=False, num_workers=1
+            valid_dataset, batch_size=batch_size, shuffle=False, num_workers=cfg.train.number_workers
         )
         model = PrithviSegmentationModule(
             image_size=IM_SIZE,
@@ -573,22 +641,38 @@ def main(cfg: DictConfig) -> None:
             weight_decay=cfg.train.weight_decay,
         )
         hydra_out_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+        print("Hydra output directory : ", hydra_out_dir)
         checkpoint_callback = ModelCheckpoint(
             monitor="val_mIoU",
             dirpath=hydra_out_dir,
-            filename="instageo_epoch-{epoch:02d}-val_iou-{val_mIoU:.2f}",
+            filename="instageo_best_checkpoint",
             auto_insert_metric_name=False,
             mode="max",
-            save_top_k=3,
+            save_top_k=1,
         )
 
         logger = TensorBoardLogger(hydra_out_dir, name="instageo")
+        
+        if cfg.train.mixed_precision:
+            device = get_device() 
+            if device == "cpu":
+                precision = "bf16-mixed"
+            elif device == "gpu":
+                precision = "16-mixed"
+            elif device == "tpu":
+                precision = 16
+            else:
+                precision = None
+        else:
+            precision = None
 
         trainer = pl.Trainer(
             accelerator=get_device(),
             max_epochs=cfg.train.num_epochs,
             callbacks=[checkpoint_callback],
             logger=logger,
+            precision=precision,
+            check_val_every_n_epoch=1,
         )
 
         # run training and validation
@@ -629,7 +713,7 @@ def main(cfg: DictConfig) -> None:
             ignore_index=cfg.train.ignore_index,
             weight_decay=cfg.train.weight_decay,
         )
-        trainer = pl.Trainer(accelerator=get_device())
+        trainer = pl.Trainer(accelerator=get_device(), enable_progress_bar=True)
         result = trainer.test(model, dataloaders=test_loader)
         log.info(f"Evaluation results:\n{result}")
 
@@ -705,83 +789,10 @@ def main(cfg: DictConfig) -> None:
             ) as dst:
                 dst.write(prediction, 1)
 
-    elif cfg.mode == "sliding_inference":
-        model = PrithviSegmentationModule.load_from_checkpoint(
-            cfg.checkpoint_path,
-            image_size=IM_SIZE,
-            learning_rate=cfg.train.learning_rate,
-            freeze_backbone=cfg.model.freeze_backbone,
-            num_classes=cfg.model.num_classes,
-            temporal_step=cfg.dataloader.temporal_dim,
-            class_weights=cfg.train.class_weights,
-            ignore_index=cfg.train.ignore_index,
-            weight_decay=cfg.train.weight_decay,
-        )
-        model.eval()
-        infer_filepath = os.path.join(root_dir, cfg.test_filepath)
-        assert (
-            os.path.splitext(infer_filepath)[-1] == ".json"
-        ), f"Test file path expects a json file but got {infer_filepath}"
-        output_dir = os.path.join(root_dir, "predictions")
-        os.makedirs(output_dir, exist_ok=True)
-        with open(os.path.join(infer_filepath)) as json_file:
-            hls_dataset = json.load(json_file)
-        for key, hls_tile_path in tqdm(
-            hls_dataset.items(), desc="Processing HLS Dataset"
-        ):
-            try:
-                hls_tile, _ = process_data(
-                    hls_tile_path,
-                    None,
-                    bands=cfg.dataloader.bands,
-                    no_data_value=cfg.dataloader.no_data_value,
-                    constant_multiplier=cfg.dataloader.constant_multiplier,
-                    mask_cloud=cfg.test.mask_cloud,
-                    replace_label=cfg.dataloader.replace_label,
-                    reduce_to_zero=cfg.dataloader.reduce_to_zero,
-                )
-            except rasterio.RasterioIOError:
-                continue
-            nan_mask = hls_tile == cfg.dataloader.no_data_value
-            nan_mask = np.any(nan_mask, axis=0).astype(int)
-            hls_tile, _ = process_and_augment(
-                hls_tile,
-                None,
-                mean=cfg.dataloader.mean,
-                std=cfg.dataloader.std,
-                temporal_size=cfg.dataloader.temporal_dim,
-                augment=False,
-            )
-            prediction = sliding_window_inference(
-                hls_tile,
-                model,
-                window_size=(cfg.test.img_size, cfg.test.img_size),
-                stride=cfg.test.stride,
-                batch_size=cfg.train.batch_size,
-                device=get_device(),
-            )
-            prediction = np.where(nan_mask == 1, np.nan, prediction)
-            prediction_filename = os.path.join(output_dir, f"{key}_prediction.tif")
-            with rasterio.open(hls_tile_path["tiles"]["B02_0"]) as src:
-                crs = src.crs
-                transform = src.transform
-            with rasterio.open(
-                prediction_filename,
-                "w",
-                driver="GTiff",
-                height=prediction.shape[0],
-                width=prediction.shape[1],
-                count=1,
-                dtype=str(prediction.dtype),
-                crs=crs,
-                transform=transform,
-            ) as dst:
-                dst.write(prediction, 1)
-
     # TODO: Add support for chips that are greater than image size used for training
     elif cfg.mode == "chip_inference":
         check_required_flags(["root_dir", "test_filepath", "checkpoint_path"], cfg)
-        output_dir = os.path.join(root_dir, "predictions")
+        output_dir = cfg.output_dir
         os.makedirs(output_dir, exist_ok=True)
         test_dataset = InstaGeoDataset(
             filename=test_filepath,
@@ -816,7 +827,6 @@ def main(cfg: DictConfig) -> None:
             weight_decay=cfg.train.weight_decay,
         )
         chip_inference(test_loader, output_dir, model, device=get_device())
-
 
 if __name__ == "__main__":
     main()
