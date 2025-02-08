@@ -30,8 +30,7 @@ import torch.nn as nn
 import yaml  # type: ignore
 from absl import logging
 
-from instageo.model.Prithvi import ViTEncoder
-
+from instageo.model.encoders.Prithvi import ViTEncoder
 
 def download_file(url: str, filename: str | Path, retries: int = 3) -> None:
     """Downloads a file from the given URL and saves it to a local file.
@@ -117,95 +116,84 @@ class Norm2D(nn.Module):
         return x
 
 
-import math 
-class SegformerMLP(nn.Module):
-    """
-    Linear Embedding.
+class ResidualUpsamplingBlock(nn.Module):
+    """Residual Upsampling Block.
+
+    Args:
+        in_channels (int): Number of input channels.
+        out_channels (int): Number of output channels.
     """
 
-    def __init__(self, config: dict, input_dim):
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.proj = nn.Linear(input_dim, config.decoder_hidden_size)
 
-    def forward(self, hidden_states: torch.Tensor):
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
-        hidden_states = self.proj(hidden_states)
-        return hidden_states
-    
-import argparse
-def dict_to_namespace(d):
-    """Recursively convert dictionary to argparse.Namespace"""
-    namespace = argparse.Namespace()
-    for key, value in d.items():
-        setattr(namespace, key, dict_to_namespace(value) if isinstance(value, dict) else value)
-    return namespace
-
-config_dict = {
-     "hidden_sizes" : [32, 64, 160, 256],
-     "decoder_hidden_size" : 256,
-     "num_encoder_blocks": 4, 
-     "num_labels" : 2,
-     "classifier_dropout_prob" : 0.1
-}
-config = dict_to_namespace(config_dict)
-
-class SegformerDecodeHead(nn.Module):
-    def __init__(self, config):
-        super().__init__()  # Fix here: remove config from super()
-        self.config = config
-        # Rest of the code remains unchanged
-        # linear layers which will unify the channel dimension of each of the encoder blocks to the same config.decoder_hidden_size
-        mlps = []
-        for i in range(config.num_encoder_blocks):
-            mlp = SegformerMLP(config, input_dim=config.hidden_sizes[i])
-            mlps.append(mlp)
-        self.linear_c = nn.ModuleList(mlps)
-
-        # the following 3 layers implement the ConvModule of the original implementation
-        self.linear_fuse = nn.Conv2d(
-            in_channels=config.decoder_hidden_size * config.num_encoder_blocks,
-            out_channels=config.decoder_hidden_size,
-            kernel_size=1,
-            bias=False,
+        # Main upsampling path
+        self.upsample = nn.Sequential(
+            nn.ConvTranspose2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                output_padding=1,
+            ),
+            nn.Conv2d(
+                in_channels=out_channels,
+                out_channels=out_channels,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
         )
-        self.batch_norm = nn.BatchNorm2d(config.decoder_hidden_size)
-        self.activation = nn.ReLU()
 
-        self.dropout = nn.Dropout(config.classifier_dropout_prob)
-        self.classifier = nn.Conv2d(config.decoder_hidden_size, config.num_labels, kernel_size=1)
+        # Shortcut (skip connection) - Uses a 1x1 convolution to match dimensions
+        self.skip_connection = nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=1, stride=2, output_padding=1),
+            nn.BatchNorm2d(out_channels)
+        )
 
-        self.config = config
+        self.relu = nn.ReLU()
 
-    def forward(self, encoder_hidden_states: torch.FloatTensor) -> torch.Tensor:
-        batch_size = encoder_hidden_states[-1].shape[0]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.skip_connection(x)  # Skip connection
+        out = self.upsample(x)  # Main path
+        out += identity  # Add residual connection
+        return self.relu(out)  # Apply ReLU
+    
+class Upscaling_block(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        """Upscaling block.
 
-        all_hidden_states = ()
-        for encoder_hidden_state, mlp in zip(encoder_hidden_states, self.linear_c):
-            if self.config.reshape_last_stage is False and encoder_hidden_state.ndim == 3:
-                height = width = int(math.sqrt(encoder_hidden_state.shape[-1]))
-                encoder_hidden_state = (
-                    encoder_hidden_state.reshape(batch_size, height, width, -1).permute(0, 3, 1, 2).contiguous()
-                )
+        Args:
+            in_channels (int): number of input channels.
+            out_channels (int): number of output channels.
 
-            # unify channel dimension
-            height, width = encoder_hidden_state.shape[2], encoder_hidden_state.shape[3]
-            encoder_hidden_state = mlp(encoder_hidden_state)
-            encoder_hidden_state = encoder_hidden_state.permute(0, 2, 1)
-            encoder_hidden_state = encoder_hidden_state.reshape(batch_size, -1, height, width)
-            # upsample
-            encoder_hidden_state = nn.functional.interpolate(
-                encoder_hidden_state, size=encoder_hidden_states[0].size()[2:], mode="bilinear", align_corners=False
-            )
-            all_hidden_states += (encoder_hidden_state,)
+        Returns:
+            An upscaling block configured to upscale spatially.
+        """
+        super().__init__()
+        self.layer = nn.Sequential(
+            nn.ConvTranspose2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                output_padding=1,
+            ),
+            nn.Conv2d(
+                in_channels=out_channels,
+                out_channels=out_channels,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+        )
 
-        hidden_states = self.linear_fuse(torch.cat(all_hidden_states[::-1], dim=1))
-        hidden_states = self.batch_norm(hidden_states)
-        hidden_states = self.activation(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-
-        # logits are of shape (batch_size, num_labels, height/4, width/4)
-        logits = self.classifier(hidden_states)
-        return logits
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layer(x)
 
 class PrithviSeg(nn.Module):
     """Prithvi Segmentation Model."""
@@ -258,6 +246,10 @@ class PrithviSeg(nn.Module):
         if freeze_backbone:
             for param in model.parameters():
                 param.requires_grad = False
+        else:
+            for param in model.parameters():
+                param.requires_grad = True
+    
         filtered_checkpoint_state_dict = {
             key[len("encoder.") :]: value
             for key, value in checkpoint.items()
@@ -268,53 +260,31 @@ class PrithviSeg(nn.Module):
         )
         _ = model.load_state_dict(filtered_checkpoint_state_dict)
 
+        # Expect input shape (batch_size, Channels, Timestamps, Height, Width)
         self.prithvi_100M_backbone = model
-
-        def upscaling_block(in_channels: int, out_channels: int) -> nn.Module:
-            """Upscaling block.
-
-            Args:
-                in_channels (int): number of input channels.
-                out_channels (int): number of output channels.
-
-            Returns:
-                An upscaling block configured to upscale spatially.
-            """
-            return nn.Sequential(
-                nn.ConvTranspose2d(
-                    in_channels=in_channels,
-                    out_channels=out_channels,
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                    output_padding=1,
-                ),
-                nn.Conv2d(
-                    in_channels=out_channels,
-                    out_channels=out_channels,
-                    kernel_size=3,
-                    padding=1,
-                ),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(),
-                nn.Dropout2d(p=0.5)
-            )
-
+        
         embed_dims = [
                 (model_args["embed_dim"] * model_args["num_frames"]) // (2**i)
                 for i in range(5)
             ]
+        # print("Embedding dimension : ", embed_dims) 
+        # [2304, 1152, 576, 288, 144]
         if head_type is None:
             self.segmentation_head = nn.Sequential(
-                *[upscaling_block(embed_dims[i], embed_dims[i + 1]) for i in range(4)],
+                *[Upscaling_block(embed_dims[i], embed_dims[i + 1]) for i in range(4)],
                 nn.Conv2d(
                     kernel_size=1, in_channels=embed_dims[-1], out_channels=num_classes
                 ),
             )
-        elif head_type == "segformer":
-           
-            self.segmentation_head = SegformerDecodeHead(config)
-    
+        elif head_type == "res_block":
+            self.segmentation_head = nn.Sequential(
+                *[ResidualUpsamplingBlock(embed_dims[i], embed_dims[i + 1]) for i in range(4)],
+                nn.Conv2d(
+                    kernel_size=1, in_channels=embed_dims[-1], out_channels=num_classes
+                ),
+            )
+        else:
+            raise ValueError("Head Type for Decoder takes only None, res_block")
     def forward(self, img: torch.Tensor) -> torch.Tensor:
         """Define the forward pass of the model.
 
@@ -325,14 +295,15 @@ class PrithviSeg(nn.Module):
             torch.Tensor: Output tensor after image segmentation.
         """
         features = self.prithvi_100M_backbone(img)
+        # Reshape the ViT encoder output to make it compatible to CNN input shape
         # drop cls token
-        reshaped_features = features[:, 1:, :]
+        reshaped_features = features[:, 1:, :] # patch embedding not a 2D feature map 
         feature_img_side_length = int(
             np.sqrt(reshaped_features.shape[1] // self.model_args["num_frames"])
-        )
+        ) # spatial resolution of the feature map
         reshaped_features = reshaped_features.permute(0, 2, 1).reshape(
             features.shape[0], -1, feature_img_side_length, feature_img_side_length
-        )
+        ) # (batch size , channels, height, width)
 
         out = self.segmentation_head(reshaped_features)
         return out

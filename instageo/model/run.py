@@ -48,6 +48,7 @@ from instageo.model.dataloader import (
 )
 from instageo.model.infer_utils import chip_inference, sliding_window_inference
 from instageo.model.model import PrithviSeg
+from instageo.model.losses.diceloss import MulticlassDiceLoss
 
 pl.seed_everything(seed=1042, workers=True)
 torch.backends.cudnn.deterministic = True
@@ -195,7 +196,7 @@ def create_dataloader(
     if random_sampler:
         sampler = build_random_weighted_sampler(
                     dataset,  
-                    subset_size=100, 
+                    subset_size=1000, 
                     seed = 42
                 )
         return DataLoader(
@@ -215,91 +216,8 @@ def create_dataloader(
             collate_fn=collate_fn,
             pin_memory=pin_memory,
         )
-    
-import torch.functional as F
-class DiceLoss(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(DiceLoss, self).__init__()
 
-    def forward(self, inputs, targets, smooth=1):
-        
-        #comment out if your model contains a sigmoid or equivalent activation layer
-        inputs = F.sigmoid(inputs)       
-        
-        #flatten label and prediction tensors
-        inputs = inputs.view(-1)
-        targets = targets.view(-1)
-        
-        intersection = (inputs * targets).sum()                            
-        dice = (2.*intersection + smooth)/(inputs.sum() + targets.sum() + smooth)  
-        
-        return 1 - dice
-    
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-class MulticlassDiceLoss(nn.Module):
-    """Multiclass Dice Loss with Ignore Index support."""
-    
-    def __init__(self, num_classes, softmax_dim=None, ignore_index=-1):
-        super().__init__()
-        self.num_classes = num_classes
-        self.softmax_dim = softmax_dim
-        self.ignore_index = ignore_index
-
-    def forward(self, logits, targets, reduction='mean', smooth=1e-6):
-        """
-        Computes the Dice loss for multiclass segmentation while ignoring a specific class index.
-
-        Args:
-            logits: Predicted tensor of shape (B, C, H, W).
-            targets: Ground truth tensor of shape (B, H, W) with class indices.
-            reduction: Reduction method (ignored, as dice loss computes a mean inherently).
-            smooth: Smoothing term to avoid division by zero.
-
-        Returns:
-            Dice loss.
-        """
-        # Apply softmax if needed
-        probabilities = logits
-        if self.softmax_dim is not None:
-            probabilities = F.softmax(logits, dim=self.softmax_dim)
-
-        # Ensure targets are long integers
-        targets = targets.long()
-
-        # Create a mask for valid pixels (ignore -1 labels)
-        valid_mask = targets != self.ignore_index  # Shape: (B, H, W)
-
-        # Set ignored labels to zero temporarily (for one-hot encoding)
-        masked_targets = targets.clone()
-        masked_targets[~valid_mask] = 0  # Set ignored pixels to class 0 (temporary)
-
-        # One-hot encode targets
-        targets_one_hot = F.one_hot(masked_targets, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
-
-        # Apply the mask: Exclude ignored pixels from loss computation
-        valid_mask = valid_mask.unsqueeze(1).expand_as(targets_one_hot)  # (B, C, H, W)
-        targets_one_hot = targets_one_hot * valid_mask
-        probabilities = probabilities * valid_mask
-
-        # Compute Dice loss
-        intersection = (targets_one_hot * probabilities).sum(dim=(0, 2, 3))
-        union = targets_one_hot.sum(dim=(0, 2, 3)) + probabilities.sum(dim=(0, 2, 3))
-
-        # Compute per-class Dice loss
-        dice_coeff = (2. * intersection + smooth) / (union + smooth)
-        dice_loss = -dice_coeff.log()
-
-        # Ignore ignored class in final loss computation
-        if 0 <= self.ignore_index < self.num_classes:
-            dice_loss = torch.cat([dice_loss[:self.ignore_index], dice_loss[self.ignore_index+1:]])
-
-        return dice_loss.mean()
-
-    
-# end class MulticlassDiceLoss
 class PrithviSegmentationModule(pl.LightningModule):
     """Prithvi Segmentation PyTorch Lightning Module."""
 
@@ -313,7 +231,8 @@ class PrithviSegmentationModule(pl.LightningModule):
         class_weights: List[float] = [1, 2],
         ignore_index: int = -100,
         weight_decay: float = 1e-2,
-        loss_type = "ce"
+        loss_type = "ce",
+        head_type = None
     ) -> None:
         """Initialization.
 
@@ -329,6 +248,7 @@ class PrithviSegmentationModule(pl.LightningModule):
             class_weights (List[float]): Class weights for mitigating class imbalance.
             ignore_index (int): Class index to ignore during loss computation.
             weight_decay (float): Weight decay for L2 regularization.
+            head_type (str): None or "res_block"
         """
         super().__init__()
         self.net = PrithviSeg(
@@ -336,7 +256,7 @@ class PrithviSegmentationModule(pl.LightningModule):
             num_classes=num_classes,
             temporal_step=temporal_step,
             freeze_backbone=freeze_backbone,
-            head_type="segformer"
+            head_type=head_type
         )
         weight_tensor = torch.tensor(class_weights).float() if class_weights else None
         if loss_type == "ce":
@@ -350,6 +270,7 @@ class PrithviSegmentationModule(pl.LightningModule):
         self.learning_rate = learning_rate
         self.ignore_index = ignore_index
         self.weight_decay = weight_decay
+        self.save_hyperparameters()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Define the forward pass of the model.
@@ -462,7 +383,7 @@ class PrithviSegmentationModule(pl.LightningModule):
         """
         out = self.compute_metrics(predictions, labels)
         self.log(
-            f"{stage}_loss",
+            f"{stage}/loss",
             loss,
             on_step=True,
             on_epoch=True,
@@ -470,7 +391,7 @@ class PrithviSegmentationModule(pl.LightningModule):
             logger=True,
         )
         self.log(
-            f"{stage}_aAcc",
+            f"{stage}/aAcc",
             out["acc"],
             on_step=True,
             on_epoch=True,
@@ -478,7 +399,7 @@ class PrithviSegmentationModule(pl.LightningModule):
             logger=True,
         )
         self.log(
-            f"{stage}_mIoU",
+            f"{stage}/mIoU",
             out["iou"],
             on_step=True,
             on_epoch=True,
@@ -487,38 +408,38 @@ class PrithviSegmentationModule(pl.LightningModule):
         )
         for idx, value in enumerate(out["iou_per_class"]):
             self.log(
-                f"{stage}_IoU_{idx}",
+                f"{stage}/IoU/Class_{idx}",
                 value,
                 on_step=True,
                 on_epoch=True,
-                prog_bar=True,
+                prog_bar=False,
                 logger=True,
             )
         for idx, value in enumerate(out["acc_per_class"]):
             self.log(
-                f"{stage}_Acc_{idx}",
+                f"{stage}/Acc/Class_{idx}",
                 value,
                 on_step=True,
                 on_epoch=True,
-                prog_bar=True,
+                prog_bar=False,
                 logger=True,
             )
         for idx, value in enumerate(out["precision_per_class"]):
             self.log(
-                f"{stage}_Precision_{idx}",
+                f"{stage}/Precision/Class_{idx}",
                 value,
                 on_step=True,
                 on_epoch=True,
-                prog_bar=True,
+                prog_bar=False,
                 logger=True,
             )
         for idx, value in enumerate(out["recall_per_class"]):
             self.log(
-                f"{stage}_Recall_{idx}",
+                f"{stage}/Recall/Class_{idx}",
                 value,
                 on_step=True,
                 on_epoch=True,
-                prog_bar=True,
+                prog_bar=False,
                 logger=True,
             )
 
@@ -733,9 +654,8 @@ def main(cfg: DictConfig) -> None:
             loss_type=cfg.train.loss_type
         )
         hydra_out_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-        print("Hydra output directory : ", hydra_out_dir)
         checkpoint_callback = ModelCheckpoint(
-            monitor="val_mIoU",
+            monitor="val/mIoU",
             dirpath=hydra_out_dir,
             filename="instageo_best_checkpoint",
             auto_insert_metric_name=False,
@@ -765,6 +685,7 @@ def main(cfg: DictConfig) -> None:
             logger=logger,
             precision=precision,
             check_val_every_n_epoch=1,
+            log_every_n_steps=5
         )
 
         # run training and validation
@@ -772,6 +693,7 @@ def main(cfg: DictConfig) -> None:
 
     elif cfg.mode == "eval":
         check_required_flags(["root_dir", "test_filepath", "checkpoint_path"], cfg)
+        hydra_out_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         test_dataset = InstaGeoDataset(
             filename=test_filepath,
             input_root=root_dir,
@@ -805,7 +727,8 @@ def main(cfg: DictConfig) -> None:
             ignore_index=cfg.train.ignore_index,
             weight_decay=cfg.train.weight_decay,
         )
-        trainer = pl.Trainer(accelerator=get_device(), enable_progress_bar=True)
+        logger = TensorBoardLogger(hydra_out_dir, name="instageo")
+        trainer = pl.Trainer(accelerator=get_device(), logger=logger, enable_progress_bar=True)
         result = trainer.test(model, dataloaders=test_loader)
         log.info(f"Evaluation results:\n{result}")
 
